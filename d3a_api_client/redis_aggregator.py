@@ -1,12 +1,15 @@
 import logging
-
+import uuid
+import json
 from d3a_api_client.utils import logging_decorator, blocking_get_request, \
     blocking_post_request
 from d3a_api_client.websocket_device import WebsocketMessageReceiver, WebsocketThread
 from concurrent.futures.thread import ThreadPoolExecutor
 from d3a_api_client.rest_device import RestDeviceClient
 from d3a_api_client.constants import MAX_WORKER_THREADS
-
+from d3a_api_client.redis_device import RedisDeviceClient
+from redis import StrictRedis
+from d3a_interface.utils import wait_until_timeout_blocking
 
 root_logger = logging.getLogger()
 root_logger.setLevel(logging.INFO)
@@ -36,38 +39,42 @@ class AggregatorWebsocketMessageReceiver(WebsocketMessageReceiver):
             self.command_response_buffer.append(message)
 
 
-class Aggregator(RestDeviceClient):
+class RedisAPIException(Exception):
+    pass
 
-    def __init__(self, simulation_id, domain_name, aggregator_name,
-                 websockets_domain_name, autoregister=False, accept_all_devices=True):
-        super().__init__(
-            simulation_id=simulation_id, device_id="", domain_name=domain_name,
-            websockets_domain_name=websockets_domain_name, autoregister=autoregister,
-            start_websocket=False)
 
+class RedisAggregator:
+
+    def __init__(self, simulation_id, aggregator_name, autoregister=False,
+                 accept_all_devices=True, redis_url='redis://localhost:6379'):
+
+        self.redis_db = StrictRedis.from_url(redis_url)
+        self.pubsub = self.redis_db.pubsub()
+        self.simulation_id = simulation_id
         self.aggregator_name = aggregator_name
+        self.autoregister = autoregister
         self.accept_all_devices = accept_all_devices
         self.device_uuid_list = []
         self.aggregator_uuid = None
-        self._connect_to_simulation()
+        self._connect_to_simulation(is_blocking=False)
 
-    def _connect_to_simulation(self):
-        user_aggrs = self.list_aggregators()
-        for a in user_aggrs:
-            if a["name"] == self.aggregator_name:
-                self.aggregator_uuid = a["uuid"]
+    def _connect_to_simulation(self, is_blocking=False):
+        # user_aggrs = self.list_aggregators()
+        # for a in user_aggrs:
+        #     if a["name"] == self.aggregator_name:
+        #         self.aggregator_uuid = a["uuid"]
         if self.aggregator_uuid is None:
-            aggr = self._create_aggregator()
+            aggr = self._create_aggregator(is_blocking=False)
             self.aggregator_uuid = aggr["uuid"]
-        self.start_websocket_connection()
+        # self.start_websocket_connection()
 
-    def start_websocket_connection(self):
-        self.dispatcher = AggregatorWebsocketMessageReceiver(self)
-        self.websocket_thread = WebsocketThread(self.simulation_id, f"aggregator/{self.aggregator_uuid}",
-                                                self.jwt_token,
-                                                self.websockets_domain_name, self.dispatcher)
-        self.websocket_thread.start()
-        self.callback_thread = ThreadPoolExecutor(max_workers=MAX_WORKER_THREADS)
+    # def start_websocket_connection(self):
+    #     self.dispatcher = AggregatorWebsocketMessageReceiver(self)
+    #     self.websocket_thread = WebsocketThread(self.simulation_id, f"aggregator/{self.aggregator_uuid}",
+    #                                             self.jwt_token,
+    #                                             self.websockets_domain_name, self.dispatcher)
+    #     self.websocket_thread.start()
+    #     self.callback_thread = ThreadPoolExecutor(max_workers=MAX_WORKER_THREADS)
 
     @logging_decorator('create_aggregator')
     def list_aggregators(self):
@@ -79,10 +86,25 @@ class Aggregator(RestDeviceClient):
     def _url_prefix(self):
         return f'{self.domain_name}/external-connection/aggregator-api/{self.simulation_id}'
 
-    @logging_decorator('create_aggregator')
-    def _create_aggregator(self):
-        return blocking_post_request(f'{self.aggregator_prefix}create-aggregator/',
-                                     {"name": self.aggregator_name}, self.jwt_token)
+    # @logging_decorator('create_aggregator')
+    def _create_aggregator(self, is_blocking=False):
+        # return blocking_post_request(f'{self.aggregator_prefix}create-aggregator/',
+        #                              {"name": self.aggregator_name}, self.jwt_token)
+        logging.info(f"Trying to create aggregator to SIMULATION: {self.simulation_id} "
+                     f"as client {self.aggregator_name}")
+
+        data = {"name": self.aggregator_name, "transaction_id": str(uuid.uuid4())}
+        self.redis_db.publish(f'{self.area_id}/register_participant', json.dumps(data))
+        self._blocking_command_responses["register"] = data
+
+        if is_blocking:
+            try:
+                wait_until_timeout_blocking(lambda: self.is_active, timeout=120)
+            except AssertionError:
+                raise RedisAPIException(
+                    f'API registration process timed out. Server will continue processing your '
+                    f'request on the background and will notify you as soon as the registration '
+                    f'has been completed.')
 
     @logging_decorator('create_aggregator')
     def delete_aggregator(self):
